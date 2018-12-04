@@ -5,23 +5,11 @@ import time
 
 from .cache import Cache
 
-
-class _Link(object):
-
-    __slots__ = ('key', 'expire', 'next', 'prev')
-
-    def __init__(self, key=None, expire=None):
-        self.key = key
-        self.expire = expire
-
-    def __reduce__(self):
-        return _Link, (self.key, self.expire)
-
-    def unlink(self):
-        next = self.next
-        prev = self.prev
-        prev.next = next
-        next.prev = prev
+# Python 2 and 3 compatibility
+if hasattr(dict(), "iteritems"):
+    iteritems = lambda d, *args, **kwargs: d.iteritems(*args, **kwargs) # noqa
+else:
+    iteritems = lambda d, *args, **kwargs: iter(d.items(*args, **kwargs)) # noqa
 
 
 class _Timer(object):
@@ -55,31 +43,32 @@ class _Timer(object):
 
 
 class TTLCache(Cache):
-    """LRU Cache implementation with per-item time-to-live (TTL) value."""
+    """
+    LRU Cache implementation with per-item time-to-live (TTL) value.
+    """
 
     def __init__(self, maxsize, ttl, timer=time.time, getsizeof=None):
         Cache.__init__(self, maxsize, getsizeof)
-        self.__root = root = _Link()
-        root.prev = root.next = root
-        self.__links = collections.OrderedDict()
+        self.__expiry_info = collections.OrderedDict()
+        self.__order = collections.OrderedDict()
         self.__timer = _Timer(timer)
         self.__ttl = ttl
 
     def __contains__(self, key):
         try:
-            link = self.__links[key]  # no reordering
+            expiry_time = self.__expiry_info[key]  # no reordering
         except KeyError:
             return False
         else:
-            return not (link.expire < self.__timer())
+            return (expiry_time >= self.__timer())
 
     def __getitem__(self, key, cache_getitem=Cache.__getitem__):
         try:
-            link = self.__getlink(key)
+            expiry_time = self.__getexpiry(key)
         except KeyError:
             expired = False
         else:
-            expired = link.expire < self.__timer()
+            expired = expiry_time < self.__timer()
         if expired:
             return self.__missing__(key)
         else:
@@ -89,52 +78,39 @@ class TTLCache(Cache):
         with self.__timer as time:
             self.expire(time)
             cache_setitem(self, key, value)
-        try:
-            link = self.__getlink(key)
-        except KeyError:
-            self.__links[key] = link = _Link(key)
-        else:
-            link.unlink()
-        link.expire = time + self.__ttl
-        link.next = root = self.__root
-        link.prev = prev = root.prev
-        prev.next = root.prev = link
+            try:
+                self.__getexpiry(key)
+            except KeyError:
+                self.__order[key] = None
+            else:
+                del self.__expiry_info[key]
+            self.__expiry_info[key] = time + self.__ttl
 
     def __delitem__(self, key, cache_delitem=Cache.__delitem__):
         cache_delitem(self, key)
-        link = self.__links.pop(key)
-        link.unlink()
-        if link.expire < self.__timer():
+        del self.__order[key]
+        expiry_time = self.__expiry_info.pop(key)
+        if expiry_time < self.__timer():
             raise KeyError(key)
 
     def __iter__(self):
-        root = self.__root
-        curr = root.next
-        while curr is not root:
-            # "freeze" time for iterator access
+        for key, expiry_time in iteritems(self.__expiry_info):
             with self.__timer as time:
-                if not (curr.expire < time):
-                    yield curr.key
-            curr = curr.next
+                if not (expiry_time < time):
+                    yield key
 
     def __len__(self):
-        root = self.__root
-        curr = root.next
         time = self.__timer()
-        count = len(self.__links)
-        while curr is not root and curr.expire < time:
-            count -= 1
-            curr = curr.next
+        count = len(self.__expiry_info)
+        for key, expiry_time in iteritems(self.__expiry_info):
+            if expiry_time < time:
+                count -= 1
+            else:
+                break
         return count
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        root = self.__root
-        root.prev = root.next = root
-        for link in sorted(self.__links.values(), key=lambda obj: obj.expire):
-            link.next = root
-            link.prev = prev = root.prev
-            prev.next = root.prev = link
         self.expire(self.__timer())
 
     def __repr__(self, cache_repr=Cache.__repr__):
@@ -162,16 +138,14 @@ class TTLCache(Cache):
         """Remove expired items from the cache."""
         if time is None:
             time = self.__timer()
-        root = self.__root
-        curr = root.next
-        links = self.__links
         cache_delitem = Cache.__delitem__
-        while curr is not root and curr.expire < time:
-            cache_delitem(self, curr.key)
-            del links[curr.key]
-            next = curr.next
-            curr.unlink()
-            curr = next
+        expiry_info = self.__expiry_info.copy()
+        for key, expiry_time in iteritems(expiry_info):
+            if expiry_time >= time:
+                break
+            cache_delitem(self, key)
+            del self.__expiry_info[key]
+            del self.__order[key]
 
     def clear(self):
         with self.__timer as time:
@@ -198,19 +172,20 @@ class TTLCache(Cache):
         with self.__timer as time:
             self.expire(time)
             try:
-                key = next(iter(self.__links))
+                key = next(iter(self.__order))
             except StopIteration:
                 raise KeyError('%s is empty' % self.__class__.__name__)
             else:
                 return (key, self.pop(key))
 
     if hasattr(collections.OrderedDict, 'move_to_end'):
-        def __getlink(self, key):
-            value = self.__links[key]
-            self.__links.move_to_end(key)
-            return value
+        def __getexpiry(self, key): # noqa
+            expiry_time = self.__expiry_info[key]
+            self.__order.move_to_end(key)
+            return expiry_time
     else:
-        def __getlink(self, key):
-            value = self.__links.pop(key)
-            self.__links[key] = value
-            return value
+        def __getexpiry(self, key): # noqa
+            expiry_time = self.__expiry_info[key]
+            del self.__order[key]
+            self.__order[key] = None
+            return expiry_time
